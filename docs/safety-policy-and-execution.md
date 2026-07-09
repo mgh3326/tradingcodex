@@ -58,6 +58,10 @@ an `ExecutionResult` so the operator can retry after fixing configuration,
 credentials, permissions, or IP allowlists. Once a broker submission may have
 reached the provider submit boundary, TradingCodex records `NEEDS_REVIEW` /
 unknown status and duplicate protection applies until status is reconciled.
+Before returning a connection-state preflight rejection, the service checks
+whether the same ticket already has local broker-order activity and refreshes
+that order first. If the ticket timeline shows provider progress, the response
+is `reconciled` with both the original rejection reasons and final ticket state.
 
 Order ticket ids are central-DB ids. CLI/API/MCP calls use `ticket_id` or
 `order_ticket_id`; if the same id appears with a different payload, validation
@@ -73,13 +77,18 @@ DRAFT -> PRECHECKED -> READY_FOR_APPROVAL -> APPROVED -> RESERVED
 ```
 
 Terminal or review states are `REJECTED`, `CANCELED`, `EXPIRED`, `FAILED`,
-and `NEEDS_REVIEW`. Fills create `Fill`, `BrokerOrder`, `OrderEvent`, portfolio
-ledger, snapshots, and reconciliation records. Validation submissions create
-broker-order and audit records but no fill when the broker endpoint validates
-without sending an order to a matching engine. For validation-only connector
-modes, `refresh_broker_order_status` preserves the local validated state when
-the broker endpoint intentionally does not create an external order. Live cancel
-uses the installed provider cancel path and remains audited.
+`VOIDED`, and `NEEDS_REVIEW`. Fills create `Fill`, `BrokerOrder`, `OrderEvent`,
+portfolio ledger, snapshots, and reconciliation records. Validation submissions
+create broker-order and audit records but no fill when the broker endpoint
+validates without sending an order to a matching engine. For validation-only
+connector modes, `refresh_broker_order_status` preserves the local validated
+state when the broker endpoint intentionally does not create an external order.
+Live cancel uses the installed provider cancel path and remains audited.
+
+Approved-only tickets that have no broker order and no fills may be locally
+voided through the service layer. Local void invalidates active approval
+receipts, records an order event plus audit event, and blocks later submission
+with a terminal-state reason.
 
 Signed broker credential failures are execution blockers, not execution
 attempts. The connector remains read-only with no enabled trade scopes, exposes

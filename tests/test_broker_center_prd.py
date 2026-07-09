@@ -235,6 +235,42 @@ def create_approved_fake_live_ticket(workspace: Path, ticket_id: str, broker_id:
     return f"LIVE:{ticket_id}:{broker_id}:AAPL:buy:1.0"
 
 
+def test_status_and_broker_tools_support_compact_redacted_responses(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    broker_id = "redact-live"
+    try:
+        register_fake_live_connection(workspace, broker_id)
+
+        status = call_mcp_tool(workspace, "get_tradingcodex_status", {"principal_id": "head-manager", "compact": True, "redact": True})
+        assert status["status"] == "ok"
+        assert status["compact"] is True
+        assert status["redacted"] is True
+        assert "db_path" not in status
+        assert "workspace_context" not in status
+
+        listed = call_mcp_tool(workspace, "list_broker_connections", {"principal_id": "head-manager", "compact": True, "redact": True})
+        listed_live = next(connection for connection in listed["connections"] if connection["broker_id"] == broker_id)
+        assert listed["compact"] is True
+        assert listed["redacted"] is True
+        assert listed_live["credential_ref"] == "redacted:env"
+        assert "metadata" not in listed_live
+        assert "accounts" not in listed_live
+        assert "capability_profile" not in listed_live
+
+        detail = call_mcp_tool(workspace, "get_broker_connection_status", {"principal_id": "head-manager", "broker_id": broker_id, "compact": True, "redact": True})
+        assert detail["compact"] is True
+        assert detail["redacted"] is True
+        assert detail["connection"]["broker_id"] == broker_id
+        assert detail["connection"]["credential_ref"] == "redacted:env"
+        assert detail["health"]["status"] == "ok"
+        assert "details" not in detail["health"]
+    finally:
+        from tradingcodex_service import mcp_runtime
+
+        mcp_runtime._REGISTRY_SYNCED = False
+        mcp_runtime._REGISTRY_SYNCED_DB = ""
+
+
 def test_paper_broker_sync_creates_ledger_snapshot_and_reconciliation(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
 
@@ -370,6 +406,69 @@ def test_list_order_tickets_filters_by_symbol_and_side(tmp_path: Path) -> None:
     result = call_mcp_tool(workspace, "list_order_tickets", {"symbol": "KRW-DOT", "side": "buy"})
 
     assert [ticket["ticket_id"] for ticket in result["tickets"]] == ["dot-buy"]
+
+
+def test_order_ticket_preserves_free_text_without_changing_execution_hash(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    ensure_runtime_database(workspace)
+
+    created = call_mcp_tool(
+        workspace,
+        "create_order_ticket",
+        {
+            "principal_id": "portfolio-manager",
+            "ticket_id": "free-text-ticket",
+            "symbol": "MSFT",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": 1000,
+            "thesis": "Durable demand with explicit invalidation trigger.",
+            "strategy": "Starter position only if risk approves.",
+            "notes": "Preserve this note for later review.",
+        },
+    )
+
+    assert created["ticket"]["free_text"] == {
+        "thesis": "Durable demand with explicit invalidation trigger.",
+        "strategy": "Starter position only if risk approves.",
+        "notes": "Preserve this note for later review.",
+    }
+    assert "thesis" not in created["ticket"]["canonical_order"]
+
+    detail = call_mcp_tool(workspace, "get_order_ticket", {"principal_id": "portfolio-manager", "ticket_id": "free-text-ticket"})
+    assert detail["ticket"]["free_text"]["strategy"] == "Starter position only if risk approves."
+
+    from apps.orders.models import OrderTicket
+
+    ticket = OrderTicket.objects.get(ticket_id="free-text-ticket")
+    original_hash = ticket.payload_hash
+
+    updated = call_mcp_tool(
+        workspace,
+        "create_order_ticket",
+        {
+            "principal_id": "portfolio-manager",
+            "ticket_id": "free-text-ticket",
+            "symbol": "MSFT",
+            "side": "buy",
+            "quantity": 1,
+            "order_type": "limit",
+            "limit_price": 1000,
+            "thesis": "Updated non-executable thesis text.",
+            "strategy": "Updated non-executable strategy text.",
+        },
+    )
+
+    ticket.refresh_from_db()
+    assert updated["status"] == "updated"
+    assert ticket.payload_hash == original_hash
+    assert updated["ticket"]["free_text"]["thesis"] == "Updated non-executable thesis text."
+
+    from tradingcodex_service import mcp_runtime
+
+    mcp_runtime._REGISTRY_SYNCED = False
+    mcp_runtime._REGISTRY_SYNCED_DB = ""
 
 
 def test_instrument_analyst_can_read_constraints_but_not_order_approve_or_submit(tmp_path: Path) -> None:
@@ -744,6 +843,95 @@ def test_fake_live_provider_cancel_calls_provider_cancel_path(tmp_path: Path, mo
     assert cancel["ticket"]["current_state"] == "CANCELED"
     assert cancel["ticket"]["broker_orders"][0]["broker_status"] == "canceled"
     assert FakeLiveBrokerAdapter.cancel_calls == [submitted["result"]["broker_order_id"]]
+
+
+def test_approved_only_live_ticket_can_be_voided_without_broker_order(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    ticket_id = f"fake-live-void-{uuid.uuid4().hex[:12]}"
+    broker_id = "fake-live-void"
+    FakeLiveBrokerAdapter.reset()
+    register_fake_live_connection(workspace, broker_id)
+    enable_live_policy(workspace, broker_id)
+    create_approved_fake_live_ticket(workspace, ticket_id, broker_id)
+    monkeypatch.setenv("TRADINGCODEX_ENABLE_LIVE_EXECUTION", "1")
+
+    from apps.orders.models import ApprovalReceipt, BrokerOrder, Fill, OrderTicket
+
+    ticket = OrderTicket.objects.get(ticket_id=ticket_id)
+    assert ticket.current_state == "APPROVED"
+    assert not BrokerOrder.objects.filter(ticket=ticket).exists()
+    assert not Fill.objects.filter(ticket=ticket).exists()
+    assert ApprovalReceipt.objects.filter(order_ticket_id=ticket_id, valid=True).count() == 1
+
+    result = call_mcp_tool(
+        workspace,
+        "cancel_approved_order",
+        {
+            "principal_id": "execution-operator",
+            "ticket_id": ticket_id,
+            "void_reason": "superseded approved-only ticket",
+            "superseded_by_ticket_id": "replacement-ticket",
+        },
+    )
+
+    assert result["status"] == "voided", result
+    assert result["ticket"]["current_state"] == "VOIDED"
+    assert result["invalidated_approval_receipts"] == 1
+    assert FakeLiveBrokerAdapter.cancel_calls == []
+    assert ApprovalReceipt.objects.filter(order_ticket_id=ticket_id, valid=True).count() == 0
+
+    rejected = call_mcp_tool(
+        workspace,
+        "submit_approved_order",
+        {"principal_id": "execution-operator", "ticket_id": ticket_id},
+    )
+    assert rejected["status"] == "rejected"
+    assert "voided" in "\n".join(rejected["reasons"]).lower()
+
+
+def test_submit_reconciles_existing_broker_order_before_preflight_reject(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    ticket_id = f"fake-live-race-{uuid.uuid4().hex[:12]}"
+    broker_id = "fake-live-race"
+    FakeLiveBrokerAdapter.reset()
+    register_fake_live_connection(workspace, broker_id)
+    enable_live_policy(workspace, broker_id)
+    confirmation = create_approved_fake_live_ticket(workspace, ticket_id, broker_id)
+    monkeypatch.setenv("TRADINGCODEX_ENABLE_LIVE_EXECUTION", "1")
+
+    from django.utils import timezone
+    from apps.integrations.models import BrokerConnection
+    from apps.orders.models import BrokerOrder, OrderTicket
+
+    ticket = OrderTicket.objects.get(ticket_id=ticket_id)
+    ticket.current_state = "SUBMITTED"
+    ticket.status = "SUBMITTED"
+    ticket.save(update_fields=["current_state", "status", "updated_at"])
+    BrokerOrder.objects.create(
+        ticket=ticket,
+        broker_order_id="race-existing-provider-order",
+        broker_status="submitted",
+        submitted_at=timezone.now(),
+        last_seen_at=timezone.now(),
+        metadata={"source": "race fixture"},
+    )
+
+    connection = BrokerConnection.objects.get(broker_id=broker_id)
+    connection.status = "read_only"
+    connection.save(update_fields=["status", "updated_at"])
+
+    result = call_mcp_tool(
+        workspace,
+        "submit_approved_order",
+        {"principal_id": "execution-operator", "ticket_id": ticket_id, "live_confirmation": confirmation},
+    )
+
+    assert result["status"] == "reconciled", result
+    assert result["original_rejection"]["reasons"] == [f"broker connection is not trading_enabled: {broker_id}"]
+    assert result["ticket"]["current_state"] == "FILLED"
+    assert result["reconciliation"]["status"] == "refreshed"
+    assert FakeLiveBrokerAdapter.submit_calls == []
+    assert FakeLiveBrokerAdapter.status_calls == ["race-existing-provider-order"]
 
 
 def test_fake_live_uncertain_submit_records_needs_review_and_blocks_retry(tmp_path: Path, monkeypatch) -> None:

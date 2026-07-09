@@ -2381,6 +2381,9 @@ def test_dynamic_workflow_plan_validation_and_recording(tmp_path: Path) -> None:
     }
     rejected = validate_workflow_plan(invalid)
     assert rejected["ok"] is False
+    assert rejected["diagnostics"]["status"] == "failed"
+    assert rejected["diagnostics"]["reason_code"] == "workflow_plan_invalid"
+    assert any(cause["code"] == "unknown_role" for cause in rejected["diagnostics"]["causes"])
     assert any("unknown role" in error for error in rejected["errors"])
     assert any("depends on unknown or later stage" in error for error in rejected["errors"])
     assert any("execution-operator is only valid" in error for error in rejected["errors"])
@@ -2460,6 +2463,30 @@ def test_dynamic_workflow_plan_validation_and_recording(tmp_path: Path) -> None:
         rejected_role = validate_workflow_plan(bad_plan, intake=intake)
         assert rejected_role["ok"] is False
         assert any(error_text in error for error in rejected_role["errors"])
+
+
+def test_workflow_plan_subagent_spawn_timeout_signals_inline_fallback(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    request = "Analyze NVDA. No order, no trading, no valuation."
+    preview = build_deterministic_workflow_plan(workspace, request)
+    recorded = record_workflow_plan(workspace, preview)
+    state_path = workspace / recorded["loop_state_path"]
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["updated_at"] = "2026-07-09T00:00:00Z"
+    for task in state["pending_tasks"]:
+        task["created_at"] = "2026-07-09T00:00:00Z"
+        task["timeout_seconds"] = 1
+        task["spawn_deadline_at"] = "2026-07-09T00:00:01Z"
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    plan_cli = json.loads(run(["./tcx", "subagents", "plan", request], workspace).stdout)
+
+    assert plan_cli["diagnostics"]["status"] == "failed"
+    assert plan_cli["diagnostics"]["reason_code"] == "subagent_spawn_timeout"
+    assert plan_cli["diagnostics"]["inline_fallback"]["recommended"] is True
+    assert plan_cli["diagnostics"]["inline_fallback"]["mode"] == "status_only_no_investment_analysis"
+    assert plan_cli["pending_tasks"][0]["status"] == "timed_out"
+    assert plan_cli["pending_tasks"][0]["failure"]["reason_code"] == "subagent_spawn_timeout"
 
 
 def test_workflow_and_decision_cli_surfaces(tmp_path: Path) -> None:
@@ -3187,6 +3214,27 @@ def test_workspace_path_inputs_are_contained(tmp_path: Path) -> None:
     if symlink_path is not None:
         with pytest.raises(ValueError, match="escapes"):
             create_research_artifact(workspace, {"artifact_id": "symlink-read", "markdown_path": "trading/research/outside-link.md"})
+
+
+def test_head_manager_synthesis_defaults_to_head_manager_report_path(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+
+    from tradingcodex_service.application.research import create_research_artifact
+
+    stored = create_research_artifact(
+        workspace,
+        {
+            "artifact_id": "synthesis-workflow-20260709",
+            "artifact_type": "synthesis",
+            "role": "head-manager",
+            "title": "Workflow synthesis",
+            "markdown": "# Workflow synthesis\n\n[factual] Accepted artifacts are ready for synthesis.\n",
+        },
+    )
+
+    assert stored["export_path"] == "trading/reports/head-manager/synthesis-workflow-20260709.md"
+    assert (workspace / stored["export_path"]).exists()
+
 
 def test_mcp_runtime_rejects_schema_type_and_extra_fields(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
@@ -4973,6 +5021,36 @@ def test_central_db_env_overrides(tmp_path: Path) -> None:
         env_extra={"TRADINGCODEX_DB_NAME": str(explicit), "TRADINGCODEX_HOME": str(home / "ignored")},
     ).stdout.strip()
     assert explicit_path == str(explicit)
+
+
+def test_database_url_sqlite_config_preserves_timeout(tmp_path: Path, monkeypatch) -> None:
+    from tradingcodex_service.settings import database_config_from_url
+
+    db_path = tmp_path / "url.sqlite3"
+    monkeypatch.setenv("TRADINGCODEX_SQLITE_TIMEOUT", "45")
+
+    config = database_config_from_url(f"sqlite:///{db_path}")
+
+    assert config == {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": str(db_path.resolve()),
+        "OPTIONS": {"timeout": 45},
+    }
+    assert db_path.parent.exists()
+
+
+def test_database_url_postgres_config_uses_django_postgresql_backend() -> None:
+    from tradingcodex_service.settings import database_config_from_url
+
+    config = database_config_from_url("postgresql://tcx:secret@db.local:5432/tradingcodex?sslmode=require")
+
+    assert config["ENGINE"] == "django.db.backends.postgresql"
+    assert config["NAME"] == "tradingcodex"
+    assert config["USER"] == "tcx"
+    assert config["PASSWORD"] == "secret"
+    assert config["HOST"] == "db.local"
+    assert config["PORT"] == "5432"
+    assert config["OPTIONS"] == {"sslmode": "require"}
 
 
 def test_generated_mcp_server_uses_central_db_default(tmp_path: Path) -> None:
