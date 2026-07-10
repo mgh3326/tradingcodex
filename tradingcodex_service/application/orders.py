@@ -1424,9 +1424,12 @@ def order_ticket_submit_block_reasons(workspace_root: Path | str, args: dict[str
     except ValueError:
         return []
     state = ticket.current_state or "DRAFT"
+    if state == "EXPIRED":
+        return [LOCAL_EXPIRE_REASON]
     if state in ORDER_TICKET_TERMINAL_STATES and state != "FILLED":
         return [f"order ticket is {state.lower()}"]
     return []
+
 
 def _find_broker_order_for_active_profile(workspace_root: Path | str, args: dict[str, Any], broker_order_id: str) -> Any:
     ensure_runtime_database(workspace_root)
