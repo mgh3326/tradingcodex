@@ -192,3 +192,39 @@ def test_expire_tool_visible_to_execution_operator():
     assert "execution-operator" in spec.allowed_roles
     assert spec.requires_approval is True
     assert spec.capability_required == "mcp.tradingcodex.expire_stale_approved_orders"
+
+
+def test_submit_against_expired_ticket_fails_closed_with_coded_reason(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    close = datetime.now(timezone.utc) + timedelta(hours=3)
+    create_approved_day_ticket(workspace, "expire-submit", session_close_at=close.isoformat())
+
+    freeze_deadline_clock(monkeypatch, close + timedelta(minutes=1))
+    expired = call_mcp_tool(workspace, "expire_stale_approved_orders", {"principal_id": "execution-operator", "ticket_id": "expire-submit"})
+    assert expired["status"] == "expired"
+
+    rejected = call_mcp_tool(workspace, "submit_approved_order", {"principal_id": "execution-operator", "ticket_id": "expire-submit"})
+    assert rejected["status"] == "rejected"
+    assert "ticket_expired_no_resubmit" in rejected["reasons"]
+
+
+def test_crosswalk_marks_expired_terminal_and_links_successor(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    close = datetime.now(timezone.utc) + timedelta(hours=3)
+    create_approved_day_ticket(workspace, "expire-xwalk", session_close_at=close.isoformat())
+
+    freeze_deadline_clock(monkeypatch, close + timedelta(minutes=1))
+    expired = call_mcp_tool(
+        workspace,
+        "expire_stale_approved_orders",
+        {"principal_id": "execution-operator", "ticket_id": "expire-xwalk", "superseded_by_ticket_id": "expire-xwalk-successor"},
+    )
+    assert expired["status"] == "expired"
+
+    crosswalk = call_mcp_tool(workspace, "validate_order_approval_crosswalk", {"principal_id": "execution-operator", "ticket_id": "expire-xwalk"})
+    row = next(row for row in crosswalk["rows"] if row["canonical_ticket_id"] == "expire-xwalk")
+    assert row["latest_status"]["ticket_state"] == "EXPIRED"
+    assert row["terminal_inference_allowed"] is True
+    assert "voided_without_successor" not in row["anomalies"]
+    assert "expire-xwalk-successor" in row["replacement_lineage"]["replacement_ticket_ids"]
+
