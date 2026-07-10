@@ -59,6 +59,7 @@ ORDER_TICKET_TRANSITIONS = {
     "PARTIALLY_FILLED": {"FILLED", "CANCELED", "FAILED", "NEEDS_REVIEW"},
     "NEEDS_REVIEW": {"DRAFT", "PRECHECKED", "REJECTED", "CANCELED", "VOIDED"},
 }
+LOCAL_EXPIRE_REASON = "ticket_expired_no_resubmit"
 ORDER_RESOLUTION_ERROR_FIELD = "_order_resolution_error"
 APPROVAL_TABLE_TTL_MINUTES = 15
 APPROVAL_TABLE_FEE_TAX_RESERVE_BPS = Decimal("10")
@@ -1112,6 +1113,66 @@ def _shape_order_status_response(root: Path, args: dict[str, Any], result: dict[
     else:
         shaped.setdefault("workspace_context", workspace_context_payload(root))
     return shaped
+
+def _approved_only_expiry_reasons(ticket: Any) -> list[str]:
+    """Evidence-based eligibility for a local APPROVED->EXPIRED transition.
+
+    Empty list means the ticket may be locally expired. Every check must pass:
+    APPROVED, no broker orders / fills (never touch broker-reached tickets),
+    a valid session_close_at on a DAY ticket, and the session close is in the
+    past on the deadline clock.
+    """
+    reasons: list[str] = []
+    if ticket.current_state != "APPROVED":
+        reasons.append(f"local expire requires APPROVED state, not {ticket.current_state}")
+    if ticket.broker_orders.exists() or ticket.fills.exists():
+        reasons.append("local expire is only allowed before broker orders or fills exist")
+    order = order_payload_from_ticket(ticket)
+    if str(order.get("time_in_force") or "").lower() != "day":
+        reasons.append("local expire only applies to DAY tickets with a session deadline")
+    deadline = _order_session_deadline(order)
+    if deadline is None:
+        reasons.append("ticket has no session_close_at; session expiry cannot be proven")
+    elif deadline.get("invalid"):
+        reasons.append("ticket session_close_at is not a valid ISO-8601 datetime")
+    else:
+        close = _parse_datetime(deadline["session_close_at"])
+        if close is None or _deadline_now() < close:
+            reasons.append("session_close_at has not passed yet")
+    return reasons
+
+
+def expire_approved_only_ticket(workspace_root: Path | str, ticket: Any, principal_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    root = Path(workspace_root)
+    reasons = _approved_only_expiry_reasons(ticket)
+    if reasons:
+        raise ValueError("; ".join(reasons))
+    order = order_payload_from_ticket(ticket)
+    session_deadline = _order_session_deadline(order) or {}
+    payload = {
+        "mode": "local_session_expiry",
+        "expire_reason": LOCAL_EXPIRE_REASON,
+        "reason": str(args.get("reason") or args.get("expire_reason") or "approved-only DAY ticket past session close"),
+        "session_deadline": session_deadline,
+        "superseded_by_ticket_id": str(args.get("superseded_by_ticket_id") or ""),
+    }
+    invalidated = invalidate_approval_receipts_for_ticket(root, ticket.ticket_id, principal_id, payload)
+    transition_order_ticket(ticket, "EXPIRED", principal_id, payload)
+    ticket.refresh_from_db()
+    result = {
+        "status": "expired",
+        "ticket_id": ticket.ticket_id,
+        "expire_reason": LOCAL_EXPIRE_REASON,
+        "session_deadline": session_deadline,
+        "invalidated_approval_receipts": invalidated,
+        "successor_guidance": "propose a next-session successor ticket with fresh checks, a new approval, and a new LIVE confirmation; do not reuse or auto-recreate this ticket",
+        "ticket": serialize_order_ticket(ticket, include_related=True),
+        "db_canonical": True,
+        "workspace_context": workspace_context_payload(root),
+    }
+    write_audit_event(root, {"type": "order_ticket.expire.accepted", "payload": result}, principal_id, "service")
+    return result
+
 
 def void_approved_only_ticket(workspace_root: Path | str, ticket: Any, principal_id: str, args: dict[str, Any]) -> dict[str, Any]:
     root = Path(workspace_root)
