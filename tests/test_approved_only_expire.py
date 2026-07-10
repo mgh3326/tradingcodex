@@ -161,3 +161,34 @@ def test_sweep_expires_only_eligible_tickets_and_is_idempotent(tmp_path: Path, m
     again = orders.expire_stale_approved_orders(workspace, {"principal_id": "execution-operator"})
     assert again["expired"] == []
     assert '"order_ticket.expire.swept"' in audit_text(workspace)
+
+
+def test_mcp_tool_expire_single_and_sweep_as_execution_operator(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    close = datetime.now(timezone.utc) + timedelta(hours=3)
+    create_approved_day_ticket(workspace, "mcp-expire-one", session_close_at=close.isoformat())
+    create_approved_day_ticket(workspace, "mcp-expire-sweep", session_close_at=close.isoformat())
+
+    freeze_deadline_clock(monkeypatch, close + timedelta(minutes=1))
+
+    single = call_mcp_tool(
+        workspace,
+        "expire_stale_approved_orders",
+        {"principal_id": "execution-operator", "ticket_id": "mcp-expire-one", "reason": "canary cleanup"},
+    )
+    assert single["status"] == "expired"
+    assert single["ticket"]["current_state"] == "EXPIRED"
+    assert single["expire_reason"] == "ticket_expired_no_resubmit"
+
+    swept = call_mcp_tool(workspace, "expire_stale_approved_orders", {"principal_id": "execution-operator"})
+    assert swept["status"] == "swept"
+    assert {row["ticket_id"] for row in swept["expired"]} == {"mcp-expire-sweep"}
+
+
+def test_expire_tool_visible_to_execution_operator():
+    from tradingcodex_service.mcp_runtime import TOOL_SPECS
+
+    spec = next(tool for tool in TOOL_SPECS if tool.name == "expire_stale_approved_orders")
+    assert "execution-operator" in spec.allowed_roles
+    assert spec.requires_approval is True
+    assert spec.capability_required == "mcp.tradingcodex.expire_stale_approved_orders"
