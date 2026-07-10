@@ -842,6 +842,63 @@ def test_fake_live_provider_registration_gates_submit_and_records_fill_sync(tmp_
     assert FakeLiveBrokerAdapter.status_calls == [broker_order.broker_order_id]
 
 
+def test_refresh_broker_order_status_transitions_ticket_and_records_fill(tmp_path: Path, monkeypatch) -> None:
+    """Characterization test for refresh_broker_order_status (ROB-803 refactor guard).
+
+    Drives the single-ticket refresh path with the fake-live adapter in `filled`
+    mode and asserts the durable side-effects (status->state transition, fill
+    recorded, status_refreshed event, metadata refresh). The shared
+    _apply_broker_status helper must keep these side-effects identical.
+    """
+    workspace = make_workspace(tmp_path)
+    ticket_id = f"fake-live-refresh-{uuid.uuid4().hex[:12]}"
+    broker_id = "fake-live-refresh"
+    FakeLiveBrokerAdapter.reset()
+    register_fake_live_connection(workspace, broker_id)
+    enable_live_policy(workspace, broker_id)
+    confirmation = create_approved_fake_live_ticket(workspace, ticket_id, broker_id)
+    monkeypatch.setenv("TRADINGCODEX_ENABLE_LIVE_EXECUTION", "1")
+
+    submitted = call_mcp_tool(
+        workspace,
+        "submit_approved_order",
+        {"principal_id": "execution-operator", "ticket_id": ticket_id, "live_confirmation": confirmation},
+    )
+    assert submitted["status"] == "accepted", submitted
+
+    broker_order_id = submitted["result"]["broker_order_id"]
+
+    refreshed = call_mcp_tool(
+        workspace,
+        "refresh_broker_order_status",
+        {"principal_id": "execution-operator", "broker_order_id": broker_order_id},
+    )
+    assert refreshed["status"] == "refreshed"
+    assert refreshed["broker_status"] == "filled"
+    assert refreshed["broker_order_id"] == broker_order_id
+    assert refreshed["ticket"]["current_state"] == "FILLED"
+    assert refreshed["ticket"]["broker_orders"][0]["broker_status"] == "filled"
+
+    from apps.orders.models import BrokerOrder, Fill, OrderEvent, OrderTicket
+
+    ticket = OrderTicket.objects.get(ticket_id=ticket_id)
+    assert ticket.current_state == "FILLED"
+    broker_order = BrokerOrder.objects.get(ticket=ticket, broker_order_id=broker_order_id)
+    assert broker_order.broker_status == "filled"
+    assert broker_order.last_seen_at is not None
+    assert broker_order.raw_status_payload_hash
+
+    fills = Fill.objects.filter(ticket=ticket, broker_order_id=broker_order_id)
+    assert fills.exists()
+
+    refresh_event = OrderEvent.objects.get(ticket=ticket, event_type="status_refreshed")
+    assert refresh_event.actor == "execution-operator"
+    assert refresh_event.payload["broker_order_id"] == broker_order_id
+    assert refresh_event.payload["broker_status"] == "filled"
+
+    assert FakeLiveBrokerAdapter.status_calls == [broker_order_id]
+
+
 def test_fake_live_provider_cancel_calls_provider_cancel_path(tmp_path: Path, monkeypatch) -> None:
     workspace = make_workspace(tmp_path)
     ticket_id = f"fake-live-cancel-{uuid.uuid4().hex[:12]}"

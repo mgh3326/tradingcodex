@@ -941,6 +941,54 @@ def get_order_ticket(workspace_root: Path | str, args: dict[str, Any]) -> dict[s
         "workspace_context": workspace_context_payload(workspace_root),
     }
 
+def _apply_broker_status(root: Path, ticket: Any, broker_order: Any, adapter_status: dict[str, Any], principal_id: str) -> str:
+    """Apply a broker adapter status to a local ticket + broker order (ROB-803).
+
+    Shared by the single-ticket refresh path and the batch refresh path so
+    status->state-transition, fill recording, broker_order mutation, and the
+    `status_refreshed` audit event stay identical. Returns the normalized
+    lowercase broker_status. Pure of any adapter call — the status dict is
+    passed in by the caller.
+    """
+    broker_status = str(adapter_status.get("status") or "unknown").lower()
+    broker_order.broker_status = broker_status
+    broker_order.last_seen_at = datetime.now(timezone.utc)
+    broker_order.raw_status_payload_hash = stable_hash(adapter_status)
+    metadata = dict(broker_order.metadata or {})
+    metadata["last_status_refresh"] = adapter_status
+    broker_order.metadata = metadata
+    broker_order.save(update_fields=["broker_status", "last_seen_at", "raw_status_payload_hash", "metadata"])
+    record_order_event(ticket, "status_refreshed", principal_id, {"broker_order_id": broker_order.broker_order_id, "broker_status": broker_status, "adapter_status": adapter_status})
+    state_target = {
+        "filled": "FILLED",
+        "partially_filled": "PARTIALLY_FILLED",
+        "partial": "PARTIALLY_FILLED",
+        "canceled": "CANCELED",
+        "cancelled": "CANCELED",
+        "rejected": "REJECTED",
+        "expired": "EXPIRED",
+        "failed": "FAILED",
+    }.get(broker_status)
+    if state_target and ticket.current_state != state_target:
+        try:
+            transition_order_ticket(ticket, state_target, principal_id, {"broker_order_id": broker_order.broker_order_id, "broker_status": broker_status})
+        except ValueError:
+            pass
+    if adapter_status.get("filled_quantity") and adapter_status.get("average_price"):
+        fill_payload = {
+            **adapter_status,
+            "broker_order_id": broker_order.broker_order_id,
+            "submitted_at": broker_order.submitted_at.isoformat() if broker_order.submitted_at else now_iso(),
+        }
+        _record_ticket_submit_result(root, order_payload_from_ticket(ticket), {"approved_by": "status-refresh"}, fill_payload, principal_id)
+        try:
+            from tradingcodex_service.application.brokers import sync_broker_account
+
+            sync_broker_account(root, {"broker_id": ticket.broker_connection.broker_id, "principal_id": principal_id})
+        except Exception:
+            pass
+    return broker_status
+
 def refresh_broker_order_status(workspace_root: Path | str, args: dict[str, Any]) -> dict[str, Any]:
     root = Path(workspace_root)
     ensure_runtime_database(root)
@@ -999,43 +1047,7 @@ def refresh_broker_order_status(workspace_root: Path | str, args: dict[str, Any]
         return result
 
     adapter_status = adapter_for_connection(ticket.broker_connection, root).get_order_status(broker_order.broker_order_id)
-    broker_status = str(adapter_status.get("status") or "unknown").lower()
-    broker_order.broker_status = broker_status
-    broker_order.last_seen_at = datetime.now(timezone.utc)
-    broker_order.raw_status_payload_hash = stable_hash(adapter_status)
-    metadata = dict(broker_order.metadata or {})
-    metadata["last_status_refresh"] = adapter_status
-    broker_order.metadata = metadata
-    broker_order.save(update_fields=["broker_status", "last_seen_at", "raw_status_payload_hash", "metadata"])
-    record_order_event(ticket, "status_refreshed", principal_id, {"broker_order_id": broker_order.broker_order_id, "broker_status": broker_status, "adapter_status": adapter_status})
-    state_target = {
-        "filled": "FILLED",
-        "partially_filled": "PARTIALLY_FILLED",
-        "partial": "PARTIALLY_FILLED",
-        "canceled": "CANCELED",
-        "cancelled": "CANCELED",
-        "rejected": "REJECTED",
-        "expired": "EXPIRED",
-        "failed": "FAILED",
-    }.get(broker_status)
-    if state_target and ticket.current_state != state_target:
-        try:
-            transition_order_ticket(ticket, state_target, principal_id, {"broker_order_id": broker_order.broker_order_id, "broker_status": broker_status})
-        except ValueError:
-            pass
-    if adapter_status.get("filled_quantity") and adapter_status.get("average_price"):
-        fill_payload = {
-            **adapter_status,
-            "broker_order_id": broker_order.broker_order_id,
-            "submitted_at": broker_order.submitted_at.isoformat() if broker_order.submitted_at else now_iso(),
-        }
-        _record_ticket_submit_result(root, order_payload_from_ticket(ticket), {"approved_by": "status-refresh"}, fill_payload, principal_id)
-        try:
-            from tradingcodex_service.application.brokers import sync_broker_account
-
-            sync_broker_account(root, {"broker_id": ticket.broker_connection.broker_id, "principal_id": principal_id})
-        except Exception:
-            pass
+    broker_status = _apply_broker_status(root, ticket, broker_order, adapter_status, principal_id)
     ticket.refresh_from_db()
     result = {
         "status": "refreshed",
