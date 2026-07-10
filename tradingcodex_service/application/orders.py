@@ -1174,6 +1174,63 @@ def expire_approved_only_ticket(workspace_root: Path | str, ticket: Any, princip
     return result
 
 
+def sweep_expired_approved_orders(workspace_root: Path | str, args: dict[str, Any]) -> dict[str, Any]:
+    root = Path(workspace_root)
+    ensure_runtime_database(root)
+    from apps.orders.models import OrderTicket
+
+    principal_id = str(args.get("principal_id") or "execution-operator")
+    portfolio_id, account_id, strategy_id = portfolio_keys(args, root)
+    candidates = (
+        OrderTicket.objects.select_related("broker_connection", "broker_account")
+        .prefetch_related("broker_orders", "fills", "events", "check_runs")
+        .filter(current_state="APPROVED", portfolio_id=portfolio_id, account_id=account_id, strategy_id=strategy_id)
+        .order_by("created_at", "id")
+    )
+    expired: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for ticket in candidates:
+        eligibility = _approved_only_expiry_reasons(ticket)
+        if eligibility:
+            skipped.append({"ticket_id": ticket.ticket_id, "reasons": eligibility})
+            continue
+        result = expire_approved_only_ticket(root, ticket, principal_id, {"reason": args.get("reason") or "session-close sweep"})
+        expired.append({"ticket_id": ticket.ticket_id, "invalidated_approval_receipts": result["invalidated_approval_receipts"]})
+    summary = {
+        "status": "swept",
+        "expired": expired,
+        "skipped": skipped,
+        "expired_count": len(expired),
+        "db_canonical": True,
+        "workspace_context": workspace_context_payload(root),
+    }
+    write_audit_event(root, {"type": "order_ticket.expire.swept", "payload": summary}, principal_id, "service")
+    return summary
+
+
+def expire_stale_approved_orders(workspace_root: Path | str, args: dict[str, Any]) -> dict[str, Any]:
+    root = Path(workspace_root)
+    ensure_runtime_database(root)
+    principal_id = str(args.get("principal_id") or "execution-operator")
+    ticket_id = args.get("ticket_id") or args.get("order_ticket_id") or args.get("order_id")
+    if not ticket_id:
+        return sweep_expired_approved_orders(root, args)
+    ticket = get_order_ticket_model(root, args)
+    try:
+        return expire_approved_only_ticket(root, ticket, principal_id, args)
+    except ValueError as exc:
+        result = {
+            "status": "not_expirable",
+            "ticket_id": ticket.ticket_id,
+            "reasons": [str(exc)],
+            "ticket": serialize_order_ticket(ticket, include_related=True),
+            "db_canonical": True,
+            "workspace_context": workspace_context_payload(root),
+        }
+        write_audit_event(root, {"type": "order_ticket.expire.rejected", "payload": result}, principal_id, "service")
+        return result
+
+
 def void_approved_only_ticket(workspace_root: Path | str, ticket: Any, principal_id: str, args: dict[str, Any]) -> dict[str, Any]:
     root = Path(workspace_root)
     if ticket.broker_orders.exists() or ticket.fills.exists():

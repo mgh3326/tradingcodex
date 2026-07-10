@@ -61,6 +61,31 @@ def audit_text(workspace: Path) -> str:
     return audit_path.read_text() if audit_path.exists() else ""
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_order_tables():
+    from tradingcodex_service.application.runtime import ensure_runtime_database
+
+    ensure_runtime_database(None)
+    from apps.orders.models import (
+        ApprovalReceipt,
+        BrokerOrder,
+        ExecutionResult,
+        Fill,
+        OrderCheckRun,
+        OrderEvent,
+        OrderTicket,
+    )
+
+    Fill.objects.all().delete()
+    BrokerOrder.objects.all().delete()
+    ExecutionResult.objects.all().delete()
+    OrderEvent.objects.all().delete()
+    OrderCheckRun.objects.all().delete()
+    ApprovalReceipt.objects.all().delete()
+    OrderTicket.objects.all().delete()
+    yield
+
+
 def test_expire_service_transitions_approved_day_ticket_after_close(tmp_path: Path, monkeypatch) -> None:
     workspace = make_workspace(tmp_path)
     close = datetime.now(timezone.utc) + timedelta(hours=3)
@@ -101,3 +126,38 @@ def test_expire_service_rejects_before_close_and_without_session_meta(tmp_path: 
     no_meta = orders.get_order_ticket_model(workspace, {"ticket_id": "expire-no-meta"})
     reasons_no_meta = orders._approved_only_expiry_reasons(no_meta)
     assert any("session_close_at" in r for r in reasons_no_meta)
+
+
+def test_dispatcher_single_expire_and_idempotent_not_expirable(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    close = datetime.now(timezone.utc) + timedelta(hours=3)
+    create_approved_day_ticket(workspace, "expire-one", session_close_at=close.isoformat())
+
+    freeze_deadline_clock(monkeypatch, close + timedelta(minutes=1))
+    first = orders.expire_stale_approved_orders(workspace, {"principal_id": "execution-operator", "ticket_id": "expire-one"})
+    assert first["status"] == "expired"
+    assert first["ticket"]["current_state"] == "EXPIRED"
+
+    second = orders.expire_stale_approved_orders(workspace, {"principal_id": "execution-operator", "ticket_id": "expire-one"})
+    assert second["status"] == "not_expirable"
+    assert any("APPROVED" in r for r in second["reasons"])
+    assert '"order_ticket.expire.rejected"' in audit_text(workspace)
+
+
+def test_sweep_expires_only_eligible_tickets_and_is_idempotent(tmp_path: Path, monkeypatch) -> None:
+    workspace = make_workspace(tmp_path)
+    close = datetime.now(timezone.utc) + timedelta(hours=3)
+    create_approved_day_ticket(workspace, "sweep-eligible", session_close_at=close.isoformat())
+    create_approved_day_ticket(workspace, "sweep-no-meta", session_close_at=None)
+
+    freeze_deadline_clock(monkeypatch, close + timedelta(minutes=1))
+    swept = orders.expire_stale_approved_orders(workspace, {"principal_id": "execution-operator"})
+    assert swept["status"] == "swept"
+    expired_ids = {row["ticket_id"] for row in swept["expired"]}
+    skipped_ids = {row["ticket_id"] for row in swept["skipped"]}
+    assert expired_ids == {"sweep-eligible"}
+    assert "sweep-no-meta" in skipped_ids
+
+    again = orders.expire_stale_approved_orders(workspace, {"principal_id": "execution-operator"})
+    assert again["expired"] == []
+    assert '"order_ticket.expire.swept"' in audit_text(workspace)
