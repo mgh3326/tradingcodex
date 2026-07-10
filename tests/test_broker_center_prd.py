@@ -1315,3 +1315,47 @@ def test_order_lineage_read_tools_are_role_scoped_and_read_only(tmp_path):
     assert tool_by_name["request_order_approval"]["annotations"]["requires_approval"] is True
     assert tool_by_name["submit_approved_order"]["annotations"]["readOnlyHint"] is False
 
+
+def test_refresh_broker_order_statuses_tool_is_registered_and_allowlisted(tmp_path: Path) -> None:
+    from tradingcodex_service.mcp_runtime import TOOL_SPECS
+    from tradingcodex_service.application.agents import AGENT_SPECS
+
+    make_workspace(tmp_path)
+
+    spec = next(s for s in TOOL_SPECS if s.name == "refresh_broker_order_statuses")
+    assert "execution-operator" in spec.allowed_roles
+    assert spec.handler_name == "refresh_broker_order_statuses"
+    assert spec.category == "execution"
+    assert spec.experimental is True
+    assert "ticket_ids" in spec.input_schema["properties"]
+    assert spec.input_schema.get("additionalProperties") is False
+
+    allowlist = AGENT_SPECS["execution-operator"].mcp_allowlist
+    assert "refresh_broker_order_statuses" in allowlist
+    assert "refresh_broker_order_status" in allowlist
+
+
+def test_refresh_broker_order_statuses_is_listed_in_static_execution_operator_template(tmp_path: Path) -> None:
+    from tradingcodex_service.application.agents import AGENT_SPECS
+    from tradingcodex_service.mcp_runtime import TOOL_SPECS
+
+    make_workspace(tmp_path)
+
+    template_path = (
+        Path(__file__).resolve().parents[1]
+        / "workspace_templates"
+        / "modules"
+        / "fixed-subagents"
+        / "files"
+        / ".codex"
+        / "agents"
+        / "execution-operator.toml"
+    )
+    text = template_path.read_text(encoding="utf-8")
+    assert '"refresh_broker_order_statuses"' in text
+    assert '"refresh_broker_order_status"' in text
+
+    spec = next(s for s in TOOL_SPECS if s.name == "refresh_broker_order_statuses")
+    assert "execution-operator" in spec.allowed_roles
+    assert "refresh_broker_order_statuses" in AGENT_SPECS["execution-operator"].mcp_allowlist
+
